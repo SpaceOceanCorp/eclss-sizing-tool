@@ -1,4 +1,4 @@
-"""Habitat class — core ECLSS sizing computation."""
+"""Habitat class - core ECLSS sizing computation."""
 
 from eclss.constants import (
     O2_CONSUMPTION_KG_PER_CM_DAY,
@@ -31,23 +31,27 @@ _KJ_PER_DAY_TO_W = 1000.0 / 86400.0
 class Habitat:
     """ECLSS sizing model for a crewed habitat.
 
+    Two ways to specify crew:
+      1. crew_count=N (anonymous, uses BVAD reference CM rates)
+      2. crew=[CrewMember(...), ...] (individualized, BMR-scaled rates)
+
     All BVAD reference values can be overridden via constructor kwargs.
     Call calculate() to compute life support requirements.
     """
 
     def __init__(
         self,
-        # Required inputs
-        crew_count: int,
-        cabin_volume_m3: float,
-        mission_duration_days: int,
+        # Required inputs (crew_count can be omitted if crew is provided)
+        crew_count: int | None = None,
+        cabin_volume_m3: float = 0.0,
+        mission_duration_days: int = 0,
         # Atmosphere defaults
         cabin_pressure_kpa: float = CABIN_PRESSURE_NOMINAL_KPA,
         o2_pp_target_kpa: float = O2_PP_TARGET_KPA,
         co2_pp_limit_kpa: float = CO2_PP_LIMIT_KPA,
         # Mode
         loop_mode: str = "open",
-        # Crew metabolic overrides
+        # Crew metabolic overrides (used only when crew_count path, not crew list)
         o2_consumption_kg_per_cm_day: float = O2_CONSUMPTION_KG_PER_CM_DAY,
         co2_production_kg_per_cm_day: float = CO2_PRODUCTION_KG_PER_CM_DAY,
         metabolic_rate_kj_per_cm_day: float = METABOLIC_RATE_KJ_PER_CM_DAY,
@@ -63,13 +67,49 @@ class Habitat:
         equipment_heat_w_per_crew: float = EQUIPMENT_HEAT_W_PER_CREW,
         # Recovery assumptions (closed-loop)
         water_recovery_efficiency: float = WATER_RECOVERY_EFFICIENCY,
+        # Keyword-only: crew list (alternative to crew_count)
+        crew: "list[CrewMember] | None" = None,
     ):
         if loop_mode not in ("open", "closed"):
             raise ValueError(
                 f"loop_mode must be 'open' or 'closed', got '{loop_mode}'"
             )
 
+        # Resolve crew_count from crew list or explicit value
+        if crew is not None:
+            if len(crew) == 0:
+                raise ValueError("crew list must not be empty")
+            if crew_count is not None and crew_count != len(crew):
+                raise ValueError(
+                    f"crew_count={crew_count} does not match len(crew)={len(crew)}"
+                )
+            crew_count = len(crew)
+            # Compute per-capita averages from individualized crew
+            n = len(crew)
+            o2_consumption_kg_per_cm_day = sum(cm.daily_o2_kg for cm in crew) / n
+            co2_production_kg_per_cm_day = sum(cm.daily_co2_kg for cm in crew) / n
+            metabolic_rate_kj_per_cm_day = sum(cm.daily_metabolic_rate_kj for cm in crew) / n
+            metabolic_heat_sensible_kj_per_cm_day = sum(cm.daily_sensible_heat_kj for cm in crew) / n
+            metabolic_heat_latent_kj_per_cm_day = sum(cm.daily_latent_heat_kj for cm in crew) / n
+            water_vapor_output_kg_per_cm_day = sum(cm.daily_water_vapor_kg for cm in crew) / n
+            potable_water_kg_per_cm_day = sum(cm.daily_potable_water_kg for cm in crew) / n
+            food_dry_mass_kg_per_cm_day = sum(cm.daily_food_kg for cm in crew) / n
+            urine_output_kg_per_cm_day = sum(cm.daily_urine_kg for cm in crew) / n
+            fecal_output_kg_per_cm_day = sum(cm.daily_fecal_water_kg for cm in crew) / n
+
+        if crew_count is None:
+            raise ValueError("Must provide crew_count or crew")
+        if crew_count < 1:
+            raise ValueError(f"crew_count must be >= 1, got {crew_count}")
+        if cabin_volume_m3 <= 0:
+            raise ValueError(f"cabin_volume_m3 must be > 0, got {cabin_volume_m3}")
+        if mission_duration_days < 1:
+            raise ValueError(
+                f"mission_duration_days must be >= 1, got {mission_duration_days}"
+            )
+
         self.crew_count = crew_count
+        self.crew = crew
         self.cabin_volume_m3 = cabin_volume_m3
         self.mission_duration_days = mission_duration_days
         self.cabin_pressure_kpa = cabin_pressure_kpa
@@ -150,7 +190,7 @@ class Habitat:
         n = self.crew_count
 
         consumption = self.potable_water * n
-        production = (self.urine_output + self.water_vapor) * n
+        production = (self.urine_output + self.fecal_output + self.water_vapor) * n
 
         if self.loop_mode == "open":
             return {

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eclss-sizing-tool"
+version = "0.1.0"
+description = "ECLSS sizing tool for crewed spacecraft and habitats using NASA BVAD reference values"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Craig Smith" }]
+keywords = ["eclss", "life-support", "aerospace", "nasa", "bvad"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Programming Language :: Python :: 3",
+]
+dependencies = ["numpy>=1.24"]
+
+[project.urls]
+Homepage = "https://github.com/dukesmith0/eclss-sizing-tool"
+
+[project.optional-dependencies]
+notebook = ["jupyter", "matplotlib"]
+plot = ["matplotlib>=3.5"]
+yaml = ["pyyaml>=6.0"]
+dev = ["pytest", "matplotlib", "pyyaml"]
+
+[tool.setuptools.packages.find]
+include = ["eclss*"]

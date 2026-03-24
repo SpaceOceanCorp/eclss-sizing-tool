@@ -1,4 +1,4 @@
-"""ECLSSResult dataclass — output container for Habitat.calculate()."""
+"""ECLSSResult dataclass - output container for Habitat.calculate()."""
 
 from dataclasses import dataclass
 
