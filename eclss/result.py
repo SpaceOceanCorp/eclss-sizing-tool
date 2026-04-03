@@ -1,6 +1,9 @@
-"""ECLSSResult dataclass - output container for Habitat.calculate()."""
+"""Result dataclasses for ECLSS sizing and simulation output."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+import numpy as np
+from numpy.typing import NDArray
 
 
 @dataclass
@@ -39,6 +42,7 @@ class ECLSSResult:
     total_food_kg: float
     o2_from_co2_recovery_kg: float   # 0.0 for open-loop
     water_recovered_kg: float        # 0.0 for open-loop
+    sabatier_water_kg_day: float     # 0.0 for open-loop
 
     def __repr__(self) -> str:
         w = 50  # column width for labels
@@ -97,6 +101,7 @@ class ECLSSResult:
             lines.extend([
                 f"  {'O2 recovered from CO2 (Sabatier)':<{w}} {self.o2_from_co2_recovery_kg:.1f} kg",
                 f"  {'Water recovered':<{w}} {self.water_recovered_kg:.1f} kg",
+                f"  {'Sabatier water production':<{w}} {self.sabatier_water_kg_day:.3f} kg/day",
             ])
 
         lines.extend([
@@ -105,3 +110,68 @@ class ECLSSResult:
         ])
 
         return "\n".join(lines)
+
+
+@dataclass
+class TimeSeriesResult:
+    """Time-series output from hourly simulation.
+
+    All 1-D arrays have shape (n_steps + 1,) where index 0 is initial
+    conditions at t=0 and indices 1..n are post-timestep values.
+    Per-crew dicts map crew name to (n_steps,) arrays (no t=0 entry).
+    """
+
+    # Time axis
+    time_hours: NDArray[np.float64]
+    timestep_hours: float
+
+    # Cabin atmosphere state
+    cabin_o2_mass_kg: NDArray[np.float64]
+    cabin_co2_mass_kg: NDArray[np.float64]
+    cabin_o2_pp_kpa: NDArray[np.float64]
+    cabin_co2_pp_kpa: NDArray[np.float64]
+
+    # Aggregate crew demands (summed across crew, per timestep)
+    total_o2_demand_kg_hr: NDArray[np.float64]
+    total_co2_production_kg_hr: NDArray[np.float64]
+    total_heat_w: NDArray[np.float64]
+
+    # ECLSS system delivery (after rate capping)
+    o2_injected_kg_hr: NDArray[np.float64]
+    co2_removed_kg_hr: NDArray[np.float64]
+
+    # Heat actually rejected (after capacity capping)
+    heat_rejected_w: NDArray[np.float64]
+
+    # Per-crew breakdown
+    crew_o2_demand_kg_hr: dict[str, NDArray[np.float64]]
+    crew_co2_production_kg_hr: dict[str, NDArray[np.float64]]
+    crew_activity: dict[str, list[str]]
+
+    # Safe ranges (from BVAD Table 4-1)
+    o2_pp_safe_range_kpa: tuple[float, float]
+    co2_pp_safe_range_kpa: tuple[float, float]
+
+    @property
+    def n_points(self) -> int:
+        """Number of data points (initial conditions + simulation steps)."""
+        return len(self.time_hours)
+
+    @property
+    def n_steps(self) -> int:
+        """Number of simulation steps (excludes initial conditions at t=0)."""
+        return len(self.time_hours) - 1
+
+    @property
+    def duration_hours(self) -> float:
+        """Mission duration in hours."""
+        return float(self.time_hours[-1])
+
+    def __repr__(self) -> str:
+        o2_min = float(self.cabin_o2_pp_kpa.min())
+        o2_max = float(self.cabin_o2_pp_kpa.max())
+        co2_max = float(self.cabin_co2_pp_kpa.max())
+        return (f"TimeSeriesResult({self.n_steps} steps, "
+                f"{self.duration_hours:.0f}h, "
+                f"O2={o2_min:.1f}-{o2_max:.1f} kPa, "
+                f"CO2 peak={co2_max:.3f} kPa)")

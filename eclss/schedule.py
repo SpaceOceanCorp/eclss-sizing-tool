@@ -3,6 +3,8 @@
 Defines daily schedules as sequences of ActivityBlocks that must cover
 exactly 24 hours with no overlaps or gaps.
 
+All schedule types implement the Schedule protocol (schedule_for_day method).
+
 Schedule hierarchy:
   - DailySchedule: a single 24-hour activity profile
   - ConstantSchedule: same DailySchedule every day of the mission
@@ -16,7 +18,16 @@ Includes pre-built schedules:
   - ISS_WEEKLY: WeeklySchedule combining ISS_WEEKDAY and ISS_WEEKEND
 """
 
+from __future__ import annotations
 from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
+
+
+@runtime_checkable
+class Schedule(Protocol):
+    """Protocol for all schedule types. Any object with schedule_for_day works."""
+
+    def schedule_for_day(self, day: int) -> DailySchedule: ...
 from eclss.activity import (
     ActivityLevel,
     SLEEP,
@@ -79,6 +90,10 @@ class DailySchedule:
             if b.start_hour <= h < b.start_hour + b.duration_hours:
                 return b.activity
         return self.blocks[-1].activity  # edge case: exactly 24.0
+
+    def schedule_for_day(self, day: int) -> DailySchedule:
+        """Implements Schedule protocol. A DailySchedule returns itself."""
+        return self
 
 
 class ConstantSchedule:

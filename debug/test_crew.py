@@ -1,7 +1,7 @@
 """Tests for CrewMember model and BMR scaling (BVAD Eq 3-2, 3-3, 3-4)."""
 
 import pytest
-from eclss.crew import CrewMember, metabolic_rate_from_respiratory, _bmr_male, _bmr_female
+from eclss.crew import CrewMember, CrewMetabolicProfile, metabolic_rate_from_respiratory, _bmr_male, _bmr_female
 from eclss.constants import (
     O2_CONSUMPTION_KG_PER_CM_DAY,
     CO2_PRODUCTION_KG_PER_CM_DAY,
@@ -88,6 +88,20 @@ class TestCrewMemberValidation:
         with pytest.raises(ValueError, match="age"):
             CrewMember("X", -5, 70, 1.75, "male")
 
+    def test_underage_raises(self):
+        """BMR equations only valid for adults >= 19."""
+        with pytest.raises(ValueError, match="age"):
+            CrewMember("X", 18, 70, 1.75, "male")
+
+    def test_age_19_ok(self):
+        cm = CrewMember("Young", 19, 70, 1.75, "male")
+        assert cm.daily_o2_kg > 0
+
+    def test_crew_member_frozen(self):
+        cm = CrewMember("Ref", 40, 82.0, 1.77, "male")
+        with pytest.raises(AttributeError):
+            cm.mass_kg = 99.0
+
 
 # --- CrewMember Scaling ---
 
@@ -97,7 +111,7 @@ class TestCrewMemberScaling:
         """Reference CM should have a BMR scale of exactly 1.0."""
         cm = CrewMember("Ref", REFERENCE_CM_AGE, REFERENCE_CM_MASS_KG,
                         REFERENCE_CM_HEIGHT_M, "male")
-        assert cm._bmr_scale == pytest.approx(1.0, rel=1e-6)
+        assert cm.bmr_scale == pytest.approx(1.0, rel=1e-6)
 
     def test_reference_cm_o2_matches_constant(self):
         """Reference CM's scaled O2 should match the BVAD constant exactly."""
@@ -137,7 +151,102 @@ class TestCrewMemberScaling:
     def test_bmr_scale_proportional(self):
         """If BMR is 1.2x reference, all rates should be 1.2x."""
         cm = CrewMember("Test", 30, 90, 1.85, "male")
-        scale = cm._bmr_scale
+        scale = cm.bmr_scale
         assert cm.daily_o2_kg == pytest.approx(
             O2_CONSUMPTION_KG_PER_CM_DAY * scale, rel=1e-6
         )
+
+
+# --- CrewMetabolicProfile.zero() ---
+
+
+class TestCrewMetabolicProfileZero:
+    def test_zero_returns_all_zeros(self):
+        """zero() should produce a profile where every field is 0.0."""
+        z = CrewMetabolicProfile.zero()
+        for fld in z.__dataclass_fields__:
+            assert getattr(z, fld) == 0.0, f"{fld} is not 0.0"
+
+    def test_zero_overrides_all_rates(self):
+        """A crew member with zero profile should have all zero daily rates."""
+        cm = CrewMember("Zero", 30, 70, 1.75, "male",
+                        profile=CrewMetabolicProfile.zero())
+        assert cm.daily_o2_kg == 0.0
+        assert cm.daily_co2_kg == 0.0
+        assert cm.daily_metabolic_rate_kj == 0.0
+        assert cm.daily_potable_water_kg == 0.0
+        assert cm.daily_food_kg == 0.0
+
+    def test_zero_is_frozen(self):
+        """zero() profile should still be frozen."""
+        z = CrewMetabolicProfile.zero()
+        with pytest.raises(AttributeError):
+            z.o2_kg_day = 1.0
+
+
+# --- CrewMember.summary() ---
+
+
+class TestCrewMemberSummary:
+    def test_summary_returns_dict(self):
+        cm = CrewMember("Test", 35, 80.0, 1.80, "male")
+        s = cm.summary()
+        assert isinstance(s, dict)
+
+    def test_summary_has_16_keys(self):
+        cm = CrewMember("Test", 35, 80.0, 1.80, "male")
+        assert len(cm.summary()) == 16
+
+    def test_summary_keys(self):
+        cm = CrewMember("Test", 35, 80.0, 1.80, "male")
+        s = cm.summary()
+        expected_keys = {
+            "o2_kg", "co2_kg", "metabolic_rate_kj", "sensible_heat_kj",
+            "latent_heat_kj", "water_vapor_kg", "potable_water_kg",
+            "food_kg", "food_water_kg", "metabolic_water_kg",
+            "urine_kg", "fecal_water_kg", "sweat_kg",
+            "fecal_solids_kg", "urine_solids_kg", "perspiration_solids_kg",
+        }
+        assert set(s.keys()) == expected_keys
+
+    def test_summary_values_match_properties(self):
+        cm = CrewMember("Test", 35, 80.0, 1.80, "male")
+        s = cm.summary()
+        assert s["o2_kg"] == pytest.approx(cm.daily_o2_kg)
+        assert s["co2_kg"] == pytest.approx(cm.daily_co2_kg)
+        assert s["food_kg"] == pytest.approx(cm.daily_food_kg)
+
+    def test_summary_all_positive_for_normal_crew(self):
+        cm = CrewMember("Test", 35, 80.0, 1.80, "male")
+        for key, val in cm.summary().items():
+            assert val > 0, f"{key} should be positive, got {val}"
+
+
+# --- CrewMember.__repr__() ---
+
+
+class TestCrewMemberRepr:
+    def test_repr_contains_name(self):
+        cm = CrewMember("Kirk", 35, 80.0, 1.80, "male")
+        assert "Kirk" in repr(cm)
+
+    def test_repr_contains_sex(self):
+        cm = CrewMember("Kirk", 35, 80.0, 1.80, "male")
+        assert "male" in repr(cm)
+
+    def test_repr_contains_mass(self):
+        cm = CrewMember("Kirk", 35, 80.0, 1.80, "male")
+        assert "80.0kg" in repr(cm)
+
+    def test_repr_contains_bmr(self):
+        cm = CrewMember("Kirk", 35, 80.0, 1.80, "male")
+        assert "BMR=" in repr(cm)
+
+    def test_repr_contains_o2(self):
+        cm = CrewMember("Kirk", 35, 80.0, 1.80, "male")
+        assert "O2=" in repr(cm)
+        assert "kg/d" in repr(cm)
+
+    def test_repr_starts_with_classname(self):
+        cm = CrewMember("Kirk", 35, 80.0, 1.80, "male")
+        assert repr(cm).startswith("CrewMember(")

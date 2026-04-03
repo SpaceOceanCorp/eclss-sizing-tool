@@ -1,16 +1,13 @@
-"""Habitat class - core ECLSS sizing computation."""
+"""Habitat -- defines a crewed habitat and computes ECLSS requirements.
 
+The Habitat holds crew, volume, duration, and loop mode. Call calculate()
+to get steady-state daily rates and mission totals as an ECLSSResult.
+"""
+
+from enum import Enum
+
+from eclss.crew import CrewMember
 from eclss.constants import (
-    O2_CONSUMPTION_KG_PER_CM_DAY,
-    CO2_PRODUCTION_KG_PER_CM_DAY,
-    METABOLIC_RATE_KJ_PER_CM_DAY,
-    METABOLIC_HEAT_SENSIBLE_KJ_PER_CM_DAY,
-    METABOLIC_HEAT_LATENT_KJ_PER_CM_DAY,
-    WATER_VAPOR_OUTPUT_KG_PER_CM_DAY,
-    POTABLE_WATER_KG_PER_CM_DAY,
-    FOOD_DRY_MASS_KG_PER_CM_DAY,
-    URINE_OUTPUT_KG_PER_CM_DAY,
-    FECAL_OUTPUT_KG_PER_CM_DAY,
     CABIN_PRESSURE_NOMINAL_KPA,
     O2_PP_TARGET_KPA,
     CO2_PP_LIMIT_KPA,
@@ -21,227 +18,153 @@ from eclss.constants import (
 from eclss.result import ECLSSResult
 
 
-# Sabatier + electrolysis O2 recovery: 1 mol CO2 (44 g) -> 1 mol O2 (32 g)
-_SABATIER_O2_MASS_RATIO = 32.0 / 44.0
+class LoopMode(str, Enum):
+    """Habitat loop mode. Inherits from str so "open" == LoopMode.OPEN."""
+    OPEN = "open"
+    CLOSED = "closed"
 
-# kJ/day to watts: 1 kJ = 1000 J, 1 day = 86400 s
+
+# Sabatier + electrolysis stoichiometry
+_SABATIER_O2_RATIO = 32.0 / 44.0    # 1 mol CO2 -> 1 mol O2
+_SABATIER_H2O_RATIO = 36.0 / 44.0   # 1 mol CO2 -> 2 mol H2O
 _KJ_PER_DAY_TO_W = 1000.0 / 86400.0
+
+
+def _resolve_loop_mode(loop_mode: str | LoopMode) -> str:
+    """Normalize loop_mode to a plain string ("open" or "closed")."""
+    if isinstance(loop_mode, LoopMode):
+        return loop_mode.value
+    if loop_mode in ("open", "closed"):
+        return loop_mode
+    raise ValueError(f"loop_mode must be 'open' or 'closed', got '{loop_mode}'")
 
 
 class Habitat:
     """ECLSS sizing model for a crewed habitat.
 
-    Two ways to specify crew:
-      1. crew_count=N (anonymous, uses BVAD reference CM rates)
-      2. crew=[CrewMember(...), ...] (individualized, BMR-scaled rates)
-
-    All BVAD reference values can be overridden via constructor kwargs.
-    Call calculate() to compute life support requirements.
+    Args:
+        crew: List of CrewMember objects.
+        cabin_volume_m3: Habitable free volume.
+        mission_duration_days: Mission length.
+        loop_mode: "open" (all resupply) or "closed" (recovery).
+        cabin_pressure_kpa: Total cabin pressure (default 101.0).
+        o2_pp_target_kpa: O2 partial pressure target (default 21.2).
+        cabin_leakage_rate_kg_per_day: Atmosphere leakage (default 0.02).
+        equipment_heat_w_per_crew: Equipment heat per crew member.
+        water_recovery_efficiency: WPA efficiency for closed-loop.
+        sabatier_efficiency: Sabatier reactor efficiency (default 1.0).
     """
 
     def __init__(
         self,
-        # Required inputs (crew_count can be omitted if crew is provided)
-        crew_count: int | None = None,
-        cabin_volume_m3: float = 0.0,
-        mission_duration_days: int = 0,
-        # Atmosphere defaults
+        crew: list[CrewMember],
+        cabin_volume_m3: float,
+        mission_duration_days: int,
+        *,
+        loop_mode: str | LoopMode = LoopMode.OPEN,
         cabin_pressure_kpa: float = CABIN_PRESSURE_NOMINAL_KPA,
         o2_pp_target_kpa: float = O2_PP_TARGET_KPA,
         co2_pp_limit_kpa: float = CO2_PP_LIMIT_KPA,
-        # Mode
-        loop_mode: str = "open",
-        # Crew metabolic overrides (used only when crew_count path, not crew list)
-        o2_consumption_kg_per_cm_day: float = O2_CONSUMPTION_KG_PER_CM_DAY,
-        co2_production_kg_per_cm_day: float = CO2_PRODUCTION_KG_PER_CM_DAY,
-        metabolic_rate_kj_per_cm_day: float = METABOLIC_RATE_KJ_PER_CM_DAY,
-        metabolic_heat_sensible_kj_per_cm_day: float = METABOLIC_HEAT_SENSIBLE_KJ_PER_CM_DAY,
-        metabolic_heat_latent_kj_per_cm_day: float = METABOLIC_HEAT_LATENT_KJ_PER_CM_DAY,
-        water_vapor_output_kg_per_cm_day: float = WATER_VAPOR_OUTPUT_KG_PER_CM_DAY,
-        potable_water_kg_per_cm_day: float = POTABLE_WATER_KG_PER_CM_DAY,
-        food_dry_mass_kg_per_cm_day: float = FOOD_DRY_MASS_KG_PER_CM_DAY,
-        urine_output_kg_per_cm_day: float = URINE_OUTPUT_KG_PER_CM_DAY,
-        fecal_output_kg_per_cm_day: float = FECAL_OUTPUT_KG_PER_CM_DAY,
-        # Leakage & equipment
         cabin_leakage_rate_kg_per_day: float = CABIN_LEAKAGE_RATE_KG_PER_MODULE_DAY,
         equipment_heat_w_per_crew: float = EQUIPMENT_HEAT_W_PER_CREW,
-        # Recovery assumptions (closed-loop)
         water_recovery_efficiency: float = WATER_RECOVERY_EFFICIENCY,
-        # Keyword-only: crew list (alternative to crew_count)
-        crew: "list[CrewMember] | None" = None,
+        sabatier_efficiency: float = 1.0,
     ):
-        if loop_mode not in ("open", "closed"):
-            raise ValueError(
-                f"loop_mode must be 'open' or 'closed', got '{loop_mode}'"
-            )
-
-        # Resolve crew_count from crew list or explicit value
-        if crew is not None:
-            if len(crew) == 0:
-                raise ValueError("crew list must not be empty")
-            if crew_count is not None and crew_count != len(crew):
-                raise ValueError(
-                    f"crew_count={crew_count} does not match len(crew)={len(crew)}"
-                )
-            crew_count = len(crew)
-            # Compute per-capita averages from individualized crew
-            n = len(crew)
-            o2_consumption_kg_per_cm_day = sum(cm.daily_o2_kg for cm in crew) / n
-            co2_production_kg_per_cm_day = sum(cm.daily_co2_kg for cm in crew) / n
-            metabolic_rate_kj_per_cm_day = sum(cm.daily_metabolic_rate_kj for cm in crew) / n
-            metabolic_heat_sensible_kj_per_cm_day = sum(cm.daily_sensible_heat_kj for cm in crew) / n
-            metabolic_heat_latent_kj_per_cm_day = sum(cm.daily_latent_heat_kj for cm in crew) / n
-            water_vapor_output_kg_per_cm_day = sum(cm.daily_water_vapor_kg for cm in crew) / n
-            potable_water_kg_per_cm_day = sum(cm.daily_potable_water_kg for cm in crew) / n
-            food_dry_mass_kg_per_cm_day = sum(cm.daily_food_kg for cm in crew) / n
-            urine_output_kg_per_cm_day = sum(cm.daily_urine_kg for cm in crew) / n
-            fecal_output_kg_per_cm_day = sum(cm.daily_fecal_water_kg for cm in crew) / n
-
-        if crew_count is None:
-            raise ValueError("Must provide crew_count or crew")
-        if crew_count < 1:
-            raise ValueError(f"crew_count must be >= 1, got {crew_count}")
+        if not crew:
+            raise ValueError("crew must not be empty")
         if cabin_volume_m3 <= 0:
             raise ValueError(f"cabin_volume_m3 must be > 0, got {cabin_volume_m3}")
         if mission_duration_days < 1:
-            raise ValueError(
-                f"mission_duration_days must be >= 1, got {mission_duration_days}"
-            )
+            raise ValueError(f"mission_duration_days must be >= 1, got {mission_duration_days}")
 
-        self.crew_count = crew_count
-        self.crew = crew
+        self.crew = list(crew)
+        self.crew_count = len(crew)
         self.cabin_volume_m3 = cabin_volume_m3
         self.mission_duration_days = mission_duration_days
+        self.loop_mode = _resolve_loop_mode(loop_mode)
         self.cabin_pressure_kpa = cabin_pressure_kpa
         self.o2_pp_target_kpa = o2_pp_target_kpa
         self.co2_pp_limit_kpa = co2_pp_limit_kpa
-        self.loop_mode = loop_mode
-        self.o2_consumption = o2_consumption_kg_per_cm_day
-        self.co2_production = co2_production_kg_per_cm_day
-        self.metabolic_rate = metabolic_rate_kj_per_cm_day
-        self.sensible_heat = metabolic_heat_sensible_kj_per_cm_day
-        self.latent_heat = metabolic_heat_latent_kj_per_cm_day
-        self.water_vapor = water_vapor_output_kg_per_cm_day
-        self.potable_water = potable_water_kg_per_cm_day
-        self.food_dry_mass = food_dry_mass_kg_per_cm_day
-        self.urine_output = urine_output_kg_per_cm_day
-        self.fecal_output = fecal_output_kg_per_cm_day
         self.cabin_leakage = cabin_leakage_rate_kg_per_day
         self.equipment_heat = equipment_heat_w_per_crew
         self.water_recovery_efficiency = water_recovery_efficiency
+        self.sabatier_efficiency = sabatier_efficiency
+
+    def _avg(self, attr: str) -> float:
+        """Average a daily property across the crew."""
+        return sum(getattr(cm, attr) for cm in self.crew) / self.crew_count
 
     def calculate(self) -> ECLSSResult:
-        """Compute ECLSS sizing requirements and return an ECLSSResult."""
-        atmo = self._calc_atmosphere()
-        thermal = self._calc_thermal()
-        water = self._calc_water()
-        consumables = self._calc_consumables(water)
-
-        return ECLSSResult(
-            crew_count=self.crew_count,
-            cabin_volume_m3=self.cabin_volume_m3,
-            mission_duration_days=self.mission_duration_days,
-            loop_mode=self.loop_mode,
-            **atmo,
-            **thermal,
-            **water,
-            **consumables,
-        )
-
-    def _calc_atmosphere(self) -> dict:
-        """O2 generation and CO2 removal rates."""
-        n = self.crew_count
-
-        # O2 fraction of leaked atmosphere (partial pressure ratio)
-        o2_fraction = self.o2_pp_target_kpa / self.cabin_pressure_kpa
-
-        # O2 needed: crew metabolic demand + makeup for O2 lost to leakage
-        o2_rate = (self.o2_consumption * n) + (self.cabin_leakage * o2_fraction)
-
-        # CO2 removal: must match crew production rate at steady state
-        co2_rate = self.co2_production * n
-
-        return {
-            "o2_generation_rate_kg_day": o2_rate,
-            "co2_removal_rate_kg_day": co2_rate,
-            "cabin_leakage_rate_kg_day": self.cabin_leakage,
-        }
-
-    def _calc_thermal(self) -> dict:
-        """Heat rejection loads in watts."""
-        n = self.crew_count
-
-        # Convert kJ/day to W for each crew member, then multiply by crew
-        sensible_w = self.sensible_heat * _KJ_PER_DAY_TO_W * n
-        latent_w = self.latent_heat * _KJ_PER_DAY_TO_W * n
-        crew_heat = sensible_w + latent_w
-
-        equip_heat = self.equipment_heat * n
-        total = crew_heat + equip_heat
-
-        return {
-            "crew_metabolic_heat_w": crew_heat,
-            "equipment_heat_w": equip_heat,
-            "total_heat_rejection_w": total,
-        }
-
-    def _calc_water(self) -> dict:
-        """Water balance: consumption vs production."""
-        n = self.crew_count
-
-        consumption = self.potable_water * n
-        production = (self.urine_output + self.fecal_output + self.water_vapor) * n
-
-        if self.loop_mode == "open":
-            return {
-                "water_consumption_kg_day": consumption,
-                "water_production_kg_day": production,
-                "water_recovery_efficiency_required": 0.0,
-                "water_resupply_kg_day": consumption,
-            }
-
-        # Closed-loop: compute recovery
-        efficiency_required = consumption / production if production > 0 else 0.0
-        recovered = production * self.water_recovery_efficiency
-        resupply = consumption - recovered
-
-        return {
-            "water_consumption_kg_day": consumption,
-            "water_production_kg_day": production,
-            "water_recovery_efficiency_required": efficiency_required,
-            "water_resupply_kg_day": resupply,
-        }
-
-    def _calc_consumables(self, water: dict) -> dict:
-        """Mission total consumables in kg."""
+        """Compute steady-state ECLSS sizing requirements."""
         n = self.crew_count
         d = self.mission_duration_days
 
-        # Daily O2 need: crew only, leakage is atmosphere makeup
-        daily_o2 = self.o2_consumption * n
-        total_food = self.food_dry_mass * n * d
+        # Per-capita averages from crew
+        o2 = self._avg("daily_o2_kg")
+        co2 = self._avg("daily_co2_kg")
+        sensible = self._avg("daily_sensible_heat_kj")
+        latent = self._avg("daily_latent_heat_kj")
+        potable = self._avg("daily_potable_water_kg")
+        food_water = self._avg("daily_food_water_kg")
+        food = self._avg("daily_food_kg")
+        urine = self._avg("daily_urine_kg")
+        fecal = self._avg("daily_fecal_water_kg")
+        vapor = self._avg("daily_water_vapor_kg")
+        met_water = self._avg("daily_metabolic_water_kg")
+
+        # Atmosphere
+        o2_frac = self.o2_pp_target_kpa / self.cabin_pressure_kpa
+        o2_gen = (o2 * n) + (self.cabin_leakage * o2_frac)
+        co2_rem = co2 * n
+
+        # Thermal
+        crew_heat = (sensible + latent) * _KJ_PER_DAY_TO_W * n
+        equip_heat = self.equipment_heat * n
+
+        # Water
+        consumption = (potable + food_water) * n
+        production = (urine + fecal + vapor + met_water) * n
 
         if self.loop_mode == "open":
-            return {
-                "total_o2_kg": daily_o2 * d,
-                "total_water_kg": water["water_resupply_kg_day"] * d,
-                "total_food_kg": total_food,
-                "o2_from_co2_recovery_kg": 0.0,
-                "water_recovered_kg": 0.0,
-            }
+            resupply = consumption
+            eff_req = 0.0
+            sab_water = 0.0
+            o2_total = o2 * n * d
+            o2_recovered = 0.0
+            water_recovered = 0.0
+        else:
+            eff_req = consumption / production if production > 0 else 0.0
+            sab_water = co2 * n * _SABATIER_H2O_RATIO * self.sabatier_efficiency
+            recovered = production * self.water_recovery_efficiency + sab_water
+            resupply = max(0.0, consumption - recovered)
+            o2_rec_daily = co2 * n * _SABATIER_O2_RATIO * self.sabatier_efficiency
+            o2_total = max(0.0, o2 * n - o2_rec_daily) * d
+            o2_recovered = o2_rec_daily * d
+            water_recovered = recovered * d
 
-        # Closed-loop: Sabatier + electrolysis recovers O2 from CO2
-        daily_co2 = self.co2_production * n
-        daily_o2_recovered = daily_co2 * _SABATIER_O2_MASS_RATIO
-        net_daily_o2 = max(0.0, daily_o2 - daily_o2_recovered)
+        return ECLSSResult(
+            crew_count=n,
+            cabin_volume_m3=self.cabin_volume_m3,
+            mission_duration_days=d,
+            loop_mode=self.loop_mode,
+            o2_generation_rate_kg_day=o2_gen,
+            co2_removal_rate_kg_day=co2_rem,
+            cabin_leakage_rate_kg_day=self.cabin_leakage,
+            crew_metabolic_heat_w=crew_heat,
+            equipment_heat_w=equip_heat,
+            total_heat_rejection_w=crew_heat + equip_heat,
+            water_consumption_kg_day=consumption,
+            water_production_kg_day=production,
+            water_recovery_efficiency_required=eff_req,
+            water_resupply_kg_day=resupply,
+            sabatier_water_kg_day=sab_water,
+            total_o2_kg=o2_total,
+            total_water_kg=resupply * d,
+            total_food_kg=food * n * d,
+            o2_from_co2_recovery_kg=o2_recovered,
+            water_recovered_kg=water_recovered,
+        )
 
-        # Water recovered per day
-        daily_water_recovered = water["water_production_kg_day"] * self.water_recovery_efficiency
-
-        return {
-            "total_o2_kg": net_daily_o2 * d,
-            "total_water_kg": water["water_resupply_kg_day"] * d,
-            "total_food_kg": total_food,
-            "o2_from_co2_recovery_kg": daily_o2_recovered * d,
-            "water_recovered_kg": daily_water_recovered * d,
-        }
+    def __repr__(self) -> str:
+        return (f"Habitat({self.crew_count} crew, {self.cabin_volume_m3} m³, "
+                f"{self.mission_duration_days} days, {self.loop_mode})")
